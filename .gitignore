@@ -1,0 +1,6 @@
+# Local install artifacts — not for the repo
+.env
+.env.*
+!.env.example
+docker-compose.override.yml
+*.log
