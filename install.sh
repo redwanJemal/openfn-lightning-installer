@@ -8,12 +8,18 @@
 # Flags:
 #   --domain <host>        Public hostname (default: localhost)
 #   --port <port>          Host port to bind (default: 4000)
-#   --admin-email <email>  Admin email (default: admin@<domain>)
-#   --install-dir <path>   Install directory
+#   --admin-email <email>  Admin email used as EMAIL_ADMIN (default: admin@<domain>)
+#   --install-dir <path>   Install directory (default: /opt/openfn-lightning or $HOME/openfn-lightning)
 #   --non-interactive      Skip prompts; use defaults / passed flags
 #   -h, --help             Show help
 
 set -Eeuo pipefail
+
+# ---- constants -------------------------------------------------------------
+
+LIGHTNING_IMAGE="openfn/lightning:latest"
+WORKER_IMAGE="openfn/ws-worker:latest"
+POSTGRES_IMAGE="postgres:15.12-alpine"
 
 # ---- output helpers --------------------------------------------------------
 
@@ -137,7 +143,7 @@ install_docker() {
 
 install_compose_plugin() {
   if docker compose version >/dev/null 2>&1; then
-    ok "Docker Compose plugin present."
+    ok "Docker Compose plugin present: $(docker compose version --short 2>/dev/null || docker compose version | head -1)"
     return
   fi
   warn "Docker Compose v2 plugin missing; installing distro package..."
@@ -152,7 +158,7 @@ install_compose_plugin() {
       $SUDO yum install -y docker-compose-plugin
     fi
   else
-    die "Unsupported distro for automatic Compose plugin install: $OS_ID."
+    die "Unsupported distro for automatic Compose plugin install: $OS_ID. Install 'docker compose' manually."
   fi
   docker compose version >/dev/null 2>&1 || die "Compose plugin install failed."
   ok "Docker Compose plugin installed."
@@ -296,6 +302,137 @@ EOF
   set -a; . "$INSTALL_DIR/.env"; set +a
 }
 
+# ---- docker-compose.yml ----------------------------------------------------
+
+write_compose_file() {
+  # Idempotent: only write if missing or different.
+  local target="$INSTALL_DIR/docker-compose.yml"
+  local tmp; tmp="$(mktemp)"
+  cat >"$tmp" <<'YAML'
+# OpenFn Lightning — production stack
+# Pulled images only (no source checkout required).
+
+services:
+  postgres:
+    image: postgres:15.12-alpine
+    restart: ${DOCKER_RESTART_POLICY:-unless-stopped}
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  web:
+    image: openfn/lightning:latest
+    pull_policy: always
+    restart: ${DOCKER_RESTART_POLICY:-unless-stopped}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    ports:
+      - "${LIGHTNING_HOST_BIND:-0.0.0.0}:${LIGHTNING_HOST_PORT:-4000}:4000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4000/health_check || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+
+  worker:
+    image: openfn/ws-worker:latest
+    pull_policy: always
+    restart: ${DOCKER_RESTART_POLICY:-unless-stopped}
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      WORKER_SECRET: ${WORKER_SECRET}
+      WORKER_LIGHTNING_PUBLIC_KEY: ${WORKER_LIGHTNING_PUBLIC_KEY}
+      WORKER_CAPACITY: ${WORKER_CAPACITY:-5}
+      WORKER_MAX_RUN_DURATION_SECONDS: ${WORKER_MAX_RUN_DURATION_SECONDS:-300}
+      WORKER_MAX_RUN_MEMORY_MB: ${WORKER_MAX_RUN_MEMORY_MB:-500}
+    command: ["pnpm", "start:prod", "-l", "ws://web:4000/worker"]
+    expose:
+      - "2222"
+
+volumes:
+  postgres-data:
+YAML
+
+  if [[ -f "$target" ]] && cmp -s "$tmp" "$target"; then
+    ok "docker-compose.yml unchanged."
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$target"
+    ok "Wrote $target"
+  fi
+}
+
+# ---- compose wrapper -------------------------------------------------------
+
+compose() {
+  ( cd "$INSTALL_DIR" && docker compose --env-file .env "$@" )
+}
+
+pull_images() {
+  log "Pulling images: $LIGHTNING_IMAGE, $WORKER_IMAGE, $POSTGRES_IMAGE..."
+  compose pull
+  ok "Images pulled."
+}
+
+run_migrations() {
+  # OpenFn's prod image is a Mix release at /app/bin/lightning — `mix` is NOT
+  # available. Migrations are exposed via Lightning.Release.migrate/0.
+  log "Starting postgres for migrations..."
+  compose up -d postgres
+  log "Waiting for postgres to be healthy..."
+  for _ in $(seq 1 30); do
+    local state
+    state="$(compose ps --format '{{.Health}}' postgres 2>/dev/null | head -1)"
+    [[ "$state" == "healthy" ]] && break
+    sleep 2
+  done
+  log "Creating database (if needed) and running migrations..."
+  compose run --rm --no-deps web /app/bin/lightning eval "Lightning.Release.create_db()"
+  compose run --rm --no-deps web /app/bin/lightning eval "Lightning.Release.migrate()"
+  ok "Migrations complete."
+}
+
+start_stack() {
+  log "Starting full stack (web + worker + postgres)..."
+  compose up -d
+  ok "Stack started."
+}
+
+wait_for_health() {
+  # NOTE: use LIGHTNING_HOST_PORT (host-side binding) — PORT was clobbered to
+  # the container-internal value (4000) when we sourced .env.
+  local url="http://127.0.0.1:${LIGHTNING_HOST_PORT}/health_check"
+  log "Waiting for Lightning to be reachable at $url ..."
+  local attempt=0 max=60
+  while (( attempt < max )); do
+    if curl -fsS -o /dev/null "$url"; then
+      ok "Lightning is reachable."
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 2
+  done
+  err "Lightning did not become healthy within $((max * 2))s."
+  warn "Recent web logs:"
+  compose logs --tail=80 web >&2 || true
+  return 1
+}
+
 # ---- main ------------------------------------------------------------------
 
 main() {
@@ -320,10 +457,48 @@ main() {
   [[ "$PORT" =~ ^[0-9]+$ ]] || die "PORT must be numeric, got: $PORT"
 
   log "Install dir: $INSTALL_DIR"
-  mkdir -p "$INSTALL_DIR"
-  write_env_file
+  log "Domain:      $DOMAIN"
+  log "Port:        $PORT"
+  log "Admin email: $ADMIN_EMAIL"
 
-  warn "TODO: docker-compose.yml, migrations, stack start, health check."
+  mkdir -p "$INSTALL_DIR"
+
+  write_env_file
+  write_compose_file
+  pull_images
+  run_migrations
+  start_stack
+
+  if wait_for_health; then
+    cat <<EOF
+
+${C_GREEN}${C_BOLD}OpenFn Lightning is up.${C_RESET}
+
+  URL:           http://${DOMAIN}:${LIGHTNING_HOST_PORT}
+  Login page:    http://${DOMAIN}:${LIGHTNING_HOST_PORT}/users/log_in
+  Health check:  http://127.0.0.1:${LIGHTNING_HOST_PORT}/health_check
+  Config:        ${INSTALL_DIR}/.env  (chmod 600 — back this up)
+  Compose file:  ${INSTALL_DIR}/docker-compose.yml
+
+No superuser is seeded by default. Create the first one by running
+(from ${INSTALL_DIR}, replace the password — min 12 chars):
+
+  docker compose run --rm web /app/bin/lightning eval \\
+    'Lightning.Accounts.register_superuser(%{first_name: "Admin", last_name: "User", email: "${ADMIN_EMAIL}", password: "CHANGE-ME-min-12-chars"})'
+
+Then sign in at the login page above.
+
+Common commands (run from ${INSTALL_DIR}):
+  docker compose logs -f web
+  docker compose ps
+  docker compose down            # stop
+  docker compose pull && docker compose up -d   # upgrade
+
+EOF
+    exit 0
+  else
+    die "Install completed but Lightning failed health check. Inspect 'docker compose logs' in $INSTALL_DIR."
+  fi
 }
 
 main "$@"
