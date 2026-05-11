@@ -77,6 +77,23 @@ need_sudo() {
   fi
 }
 
+# ---- prompts ---------------------------------------------------------------
+
+prompt() {
+  local var_name="$1" question="$2" default="${3:-}"
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    printf -v "$var_name" '%s' "$default"
+    return
+  fi
+  local answer
+  if [[ -n "$default" ]]; then
+    read -r -p "$question [$default]: " answer </dev/tty || true
+  else
+    read -r -p "$question: " answer </dev/tty || true
+  fi
+  printf -v "$var_name" '%s' "${answer:-$default}"
+}
+
 # ---- OS detection ----------------------------------------------------------
 
 detect_os() {
@@ -159,6 +176,126 @@ ensure_docker_running() {
   die "Docker daemon is not running. Start it and re-run this script."
 }
 
+# ---- secret generators -----------------------------------------------------
+
+require_openssl() {
+  command -v openssl >/dev/null 2>&1 && return
+  log "Installing openssl..."
+  need_sudo
+  if is_debian_family; then
+    $SUDO apt-get update -y && $SUDO apt-get install -y openssl
+  elif is_rhel_family; then
+    if command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y openssl; else $SUDO yum install -y openssl; fi
+  else
+    die "openssl is required but not installed."
+  fi
+}
+
+gen_hex()    { openssl rand -hex "$1"; }
+gen_b64()    { openssl rand -base64 "$1" | tr -d '\n'; }
+gen_b64url() { openssl rand -base64 "$1" | tr -d '\n=' | tr '+/' '-_'; }
+
+gen_rsa_keypair_b64() {
+  # Generate an RSA keypair, emit base64-encoded PEMs (single line) on stdout.
+  # Output format: "<private_b64>|<public_b64>"
+  local tmpdir priv_pem pub_pem
+  tmpdir="$(mktemp -d)"
+  priv_pem="$tmpdir/private.pem"
+  pub_pem="$tmpdir/public.pem"
+  openssl genrsa -out "$priv_pem" 2048 >/dev/null 2>&1
+  openssl rsa -in "$priv_pem" -pubout -out "$pub_pem" >/dev/null 2>&1
+  local priv_b64 pub_b64
+  priv_b64="$(base64 -w0 <"$priv_pem" 2>/dev/null || base64 <"$priv_pem" | tr -d '\n')"
+  pub_b64="$(base64 -w0 <"$pub_pem" 2>/dev/null || base64 <"$pub_pem" | tr -d '\n')"
+  rm -rf "$tmpdir"
+  printf '%s|%s' "$priv_b64" "$pub_b64"
+}
+
+# ---- env file generation ---------------------------------------------------
+
+write_env_file() {
+  # Idempotent: if .env exists, preserve it untouched.
+  if [[ -f "$INSTALL_DIR/.env" ]]; then
+    ok "Existing .env found; reusing it (secrets preserved)."
+    # shellcheck disable=SC1091
+    set -a; . "$INSTALL_DIR/.env"; set +a
+    return
+  fi
+
+  log "Generating secrets..."
+  local secret_key_base worker_secret primary_enc_key postgres_password
+  secret_key_base="$(gen_b64 48)"          # ~64 chars base64
+  worker_secret="$(gen_b64 32)"            # 256-bit
+  primary_enc_key="$(gen_b64 32)"          # 32 random bytes, base64-encoded
+  postgres_password="$(gen_b64url 24)"     # url-safe (no '/' or '=' in DATABASE_URL)
+
+  local keypair priv_key pub_key
+  keypair="$(gen_rsa_keypair_b64)"
+  priv_key="${keypair%%|*}"
+  pub_key="${keypair##*|}"
+
+  local scheme="http" external_port="$PORT"
+  if [[ "$DOMAIN" != "localhost" && "$DOMAIN" != "127.0.0.1" ]]; then
+    warn "Domain is '$DOMAIN'. URL_SCHEME defaults to 'http' — set URL_SCHEME=https and URL_PORT=443 in .env once TLS is fronted by a reverse proxy."
+  fi
+
+  umask 077
+  cat >"$INSTALL_DIR/.env" <<EOF
+# OpenFn Lightning configuration — generated $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Treat this file as a secret. Permissions are restricted to the installing user.
+
+# --- Public URL ---
+URL_HOST=${DOMAIN}
+URL_PORT=${external_port}
+URL_SCHEME=${scheme}
+PORT=4000
+LISTEN_ADDRESS=0.0.0.0
+
+# --- Host port binding (controls 'ports:' mapping in docker-compose.yml) ---
+LIGHTNING_HOST_BIND=0.0.0.0
+LIGHTNING_HOST_PORT=${external_port}
+
+# --- Mode ---
+MIX_ENV=prod
+NODE_ENV=production
+DOCKER_RESTART_POLICY=unless-stopped
+
+# --- Database ---
+POSTGRES_USER=lightning
+POSTGRES_PASSWORD=${postgres_password}
+POSTGRES_DB=lightning
+DATABASE_URL=postgresql://lightning:${postgres_password}@postgres:5432/lightning
+DISABLE_DB_SSL=true
+ECTO_IPV6=false
+
+# --- Secrets (DO NOT regenerate after first run — see PRIMARY_ENCRYPTION_KEY note) ---
+SECRET_KEY_BASE=${secret_key_base}
+PRIMARY_ENCRYPTION_KEY=${primary_enc_key}
+WORKER_SECRET=${worker_secret}
+WORKER_RUNS_PRIVATE_KEY=${priv_key}
+WORKER_LIGHTNING_PUBLIC_KEY=${pub_key}
+
+# --- Admin / email ---
+EMAIL_ADMIN=${ADMIN_EMAIL}
+MAIL_PROVIDER=local
+
+# --- Storage ---
+STORAGE_BACKEND=local
+
+# --- Worker tuning ---
+WORKER_CAPACITY=5
+WORKER_MAX_RUN_DURATION_SECONDS=300
+WORKER_MAX_RUN_MEMORY_MB=500
+RUN_GRACE_PERIOD_SECONDS=10
+EOF
+  chmod 600 "$INSTALL_DIR/.env"
+  ok "Wrote $INSTALL_DIR/.env (mode 0600)"
+
+  # Export for the rest of this script.
+  # shellcheck disable=SC1091
+  set -a; . "$INSTALL_DIR/.env"; set +a
+}
+
 # ---- main ------------------------------------------------------------------
 
 main() {
@@ -168,14 +305,25 @@ main() {
 
   is_debian_family || is_rhel_family || die "Unsupported OS family. Supported: Debian/Ubuntu, RHEL/CentOS/Rocky/Alma/Fedora."
 
+  require_openssl
   install_docker
   install_compose_plugin
   ensure_docker_running
 
+  if [[ "$NON_INTERACTIVE" != "true" ]]; then
+    prompt DOMAIN       "Public hostname"   "$DOMAIN"
+    prompt PORT         "Host port to bind" "$PORT"
+    prompt ADMIN_EMAIL  "Admin email"       "${ADMIN_EMAIL:-admin@${DOMAIN}}"
+  else
+    [[ -n "$ADMIN_EMAIL" ]] || ADMIN_EMAIL="admin@${DOMAIN}"
+  fi
+  [[ "$PORT" =~ ^[0-9]+$ ]] || die "PORT must be numeric, got: $PORT"
+
   log "Install dir: $INSTALL_DIR"
-  log "Domain:      $DOMAIN"
-  log "Port:        $PORT"
-  warn "TODO: secret generation, env file, compose file, migrations."
+  mkdir -p "$INSTALL_DIR"
+  write_env_file
+
+  warn "TODO: docker-compose.yml, migrations, stack start, health check."
 }
 
 main "$@"
