@@ -483,7 +483,7 @@ ${C_GREEN}${C_BOLD}OpenFn Lightning is up.${C_RESET}
 No superuser is seeded by default. Create the first one by running
 (from ${INSTALL_DIR}, replace the password — min 12 chars):
 
-  docker compose run --rm web /app/bin/lightning eval \\
+  docker compose exec web /app/bin/lightning rpc \\
     'Lightning.Accounts.register_superuser(%{first_name: "Admin", last_name: "User", email: "${ADMIN_EMAIL}", password: "CHANGE-ME-min-12-chars"})'
 
 Then sign in at the login page above.
